@@ -5,3 +5,4 @@ requests
 gunicorn
 gevent
 gevent-websocket
+python-dotenv
