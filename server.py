@@ -177,12 +177,16 @@ def search_youtube():
 # ── Socket: client joins a room ──────────────────────────────────────────────
 @socketio.on('join')
 def on_join(data):
-    room_id = data.get('roomId', '')
+    room_id  = data.get('roomId', '')
     if not room_id:
         return
     join_room(room_id)
     room = get_room(room_id)
     if room:
+        # First socket that claims admin becomes the sync host
+        if data.get('isAdmin') and not room.get('adminSid'):
+            room['adminSid'] = request.sid
+            set_room(room_id, room)
         emit('room_state', {
             'queue':        room.get('queue', []),
             'currentIndex': room.get('currentIndex', -1),
@@ -197,6 +201,10 @@ def on_join(data):
 def on_leave(data):
     room_id = data.get('roomId', '')
     if room_id:
+        room = get_room(room_id)
+        if room and room.get('adminSid') == request.sid:
+            room['adminSid'] = None
+            set_room(room_id, room)
         leave_room(room_id)
 
 
@@ -223,12 +231,15 @@ def on_queue_update(data):
     }, room=room_id, include_self=False)
 
 
-# ── Socket: playback position heartbeat ─────────────────────────────────────
+# ── Socket: playback position heartbeat (admin only) ───────────────────────
 @socketio.on('playback_sync')
 def on_playback_sync(data):
     room_id = data.get('roomId', '')
     room    = get_room(room_id)
     if not room:
+        return
+    # Only accept heartbeats from the designated admin socket
+    if room.get('adminSid') and room['adminSid'] != request.sid:
         return
     room['playbackTime'] = data.get('playbackTime', 0)
     room['playerState']  = data.get('playerState', -1)
