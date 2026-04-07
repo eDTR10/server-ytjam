@@ -5,8 +5,78 @@ import requests
 import os
 import uuid
 import time
+import threading
 
 YT_API_KEY = os.environ.get('YT_API_KEY', '')
+
+# ── Search result cache (reduces YouTube API quota burn across many users) ──────
+_search_cache      = {}
+_search_cache_lock = threading.Lock()
+CACHE_TTL          = 300  # seconds
+
+def _cache_get(key):
+    with _search_cache_lock:
+        entry = _search_cache.get(key)
+        if entry and (time.time() - entry['ts']) < CACHE_TTL:
+            return entry['data']
+        return None
+
+def _cache_set(key, data):
+    with _search_cache_lock:
+        _search_cache[key] = {'data': data, 'ts': time.time()}
+        # Evict expired entries when the cache grows large
+        if len(_search_cache) > 500:
+            cutoff = time.time() - CACHE_TTL
+            for k in [k for k, v in list(_search_cache.items()) if v['ts'] < cutoff]:
+                del _search_cache[k]
+
+
+def _search_innertube(query, max_results):
+    """Search YouTube via the Innertube API — no API key or quota required."""
+    res = requests.post(
+        'https://www.youtube.com/youtubei/v1/search',
+        json={
+            'context': {
+                'client': {
+                    'clientName':    'WEB',
+                    'clientVersion': '2.20231219.04.00',
+                    'hl': 'en', 'gl': 'US'
+                }
+            },
+            'query': query
+        },
+        headers={'Content-Type': 'application/json', 'Accept-Language': 'en'},
+        timeout=8
+    )
+    res.raise_for_status()
+    items = []
+    sections = (
+        res.json()
+        .get('contents', {})
+        .get('twoColumnSearchResultsRenderer', {})
+        .get('primaryContents', {})
+        .get('sectionListRenderer', {})
+        .get('contents', [])
+    )
+    for section in sections:
+        for item in section.get('itemSectionRenderer', {}).get('contents', []):
+            vr = item.get('videoRenderer')
+            if not vr:
+                continue
+            video_id = vr.get('videoId')
+            title    = ''.join(r.get('text', '') for r in vr.get('title', {}).get('runs', []))
+            channel  = ''.join(r.get('text', '') for r in vr.get('ownerText', {}).get('runs', []))
+            if video_id and title:
+                items.append({
+                    'videoId': video_id,
+                    'title':   title,
+                    'thumb':   f'https://img.youtube.com/vi/{video_id}/mqdefault.jpg',
+                    'channel': channel,
+                })
+            if len(items) >= max_results:
+                return items
+    return items
+
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dictjam-secret-key')
@@ -55,30 +125,53 @@ def room_info(room_id):
     return jsonify({"id": room_id, "name": room.get("name", "Jam"), "exists": True})
 
 
-# ── REST: YouTube search proxy ───────────────────────────────────────────────
+# ── REST: YouTube search proxy (cached + Innertube fallback) ─────────────────
 @app.route('/api/search', methods=['GET'])
 def search_youtube():
     query = request.args.get('q', '').strip()
     if not query:
-        return jsonify({"items": []})
+        return jsonify({'items': []})
     max_results = min(int(request.args.get('maxResults', 8)), 15)
-    try:
-        res = requests.get(
-            'https://www.googleapis.com/youtube/v3/search',
-            params={'part': 'snippet', 'type': 'video', 'maxResults': max_results, 'q': query, 'key': YT_API_KEY},
-            timeout=8
-        )
-        res.raise_for_status()
-        data = res.json()
-        items = [{
-            'videoId': i['id']['videoId'],
-            'title':   i['snippet']['title'],
-            'thumb':   i['snippet']['thumbnails']['default']['url'],
-            'channel': i['snippet']['channelTitle'],
-        } for i in data.get('items', [])]
-        return jsonify({'items': items})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 502
+
+    cache_key = f"{query.lower()}:{max_results}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return jsonify({'items': cached})
+
+    items = []
+
+    # 1️⃣  Official YouTube Data API v3 (costs 100 quota units per call)
+    if YT_API_KEY:
+        try:
+            res = requests.get(
+                'https://www.googleapis.com/youtube/v3/search',
+                params={'part': 'snippet', 'type': 'video',
+                        'maxResults': max_results, 'q': query, 'key': YT_API_KEY},
+                timeout=8
+            )
+            if res.ok:
+                data = res.json()
+                items = [{
+                    'videoId': i['id']['videoId'],
+                    'title':   i['snippet']['title'],
+                    'thumb':   i['snippet']['thumbnails']['default']['url'],
+                    'channel': i['snippet']['channelTitle'],
+                } for i in data.get('items', [])]
+        except Exception:
+            pass
+
+    # 2️⃣  Innertube fallback — no key, no quota, used when official API is
+    #     unavailable, quota-exceeded, or YT_API_KEY is not set.
+    if not items:
+        try:
+            items = _search_innertube(query, max_results)
+        except Exception as e:
+            return jsonify({'error': str(e), 'items': []}), 502
+
+    if items:
+        _cache_set(cache_key, items)
+
+    return jsonify({'items': items})
 
 
 # ── Socket: client joins a room ──────────────────────────────────────────────
