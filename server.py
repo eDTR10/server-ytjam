@@ -103,6 +103,7 @@ def create_room():
     room_id   = uuid.uuid4().hex[:8]
     body      = request.json or {}
     room_name = body.get('name', 'My Jam')[:40]
+    creator_token = body.get('creatorToken', '')
     set_room(room_id, {
         "id":           room_id,
         "name":         room_name,
@@ -111,6 +112,8 @@ def create_room():
         "playbackTime": 0,
         "playerState":  -1,
         "lastSyncedAt": 0,
+        "creatorToken": creator_token,
+        "adminSid":     None,
         "created":      int(time.time())
     })
     return jsonify({"roomId": room_id, "name": room_name}), 201
@@ -183,8 +186,9 @@ def on_join(data):
     join_room(room_id)
     room = get_room(room_id)
     if room:
-        # First socket that claims admin becomes the sync host
-        if data.get('isAdmin') and not room.get('adminSid'):
+        # Identify the creator by their persistent token — works across reconnects
+        token = data.get('creatorToken', '')
+        if token and token == room.get('creatorToken'):
             room['adminSid'] = request.sid
             set_room(room_id, room)
         emit('room_state', {
@@ -192,7 +196,8 @@ def on_join(data):
             'currentIndex': room.get('currentIndex', -1),
             'playbackTime': room.get('playbackTime', 0),
             'playerState':  room.get('playerState', -1),
-            'lastSyncedAt': room.get('lastSyncedAt', 0)
+            'lastSyncedAt': room.get('lastSyncedAt', 0),
+            'isCreator':    (token != '' and token == room.get('creatorToken'))
         })
 
 
